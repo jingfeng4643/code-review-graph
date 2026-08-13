@@ -4,6 +4,10 @@
 
 ### Added
 
+- Added first-class ZCode support. `code-review-graph install --platform zcode`
+  creates workspace-scoped `.zcode/config.json` with the MCP server and
+  auto-update hooks, writes `.zcode/skills/`, and injects graph-first
+  instructions into `AGENTS.md`.
 - Added a Voyage AI embedding provider (`--provider voyage`, key from
   `VOYAGE_API_KEY`, opt-in request throttling via
   `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each

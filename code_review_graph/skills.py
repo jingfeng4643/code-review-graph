@@ -254,6 +254,16 @@ PLATFORMS: dict[str, dict[str, Any]] = {
         "format": "object",
         "needs_type": True,
     },
+    "zcode": {
+        "name": "ZCode",
+        "config_path": lambda root: root / ".zcode" / "config.json",
+        # ZCode uses a nested "mcp.servers" object inside .zcode/config.json,
+        # so the key is treated as a dotted path by install/uninstall helpers.
+        "key": "mcp.servers",
+        "detect": lambda: True,
+        "format": "object",
+        "needs_type": False,
+    },
 }
 
 
@@ -502,6 +512,45 @@ def _strip_jsonc(text: str) -> str:
     return "".join(out)
 
 
+def _key_path(server_key: str) -> list[str]:
+    """Split a server key into nested path components.
+
+    ZCode stores MCP servers under ``mcp.servers`` inside ``.zcode/config.json``,
+    so a dotted key needs to be traversed as nested objects. Flat keys such as
+    ``mcpServers`` are returned as a single-element list and work exactly like
+    before.
+    """
+    return server_key.split(".")
+
+
+def _get_nested(
+    obj: dict[str, Any],
+    key_path: list[str],
+    default: Any,
+) -> Any:
+    """Return the value at ``key_path``, creating intermediate dicts as needed."""
+    cur = obj
+    for key in key_path[:-1]:
+        if key not in cur or not isinstance(cur[key], dict):
+            cur[key] = {}
+        cur = cur[key]
+    return cur.setdefault(key_path[-1], default)
+
+
+def _set_nested(
+    obj: dict[str, Any],
+    key_path: list[str],
+    value: Any,
+) -> None:
+    """Set ``value`` at ``key_path``, creating intermediate dicts as needed."""
+    cur = obj
+    for key in key_path[:-1]:
+        if key not in cur or not isinstance(cur[key], dict):
+            cur[key] = {}
+        cur = cur[key]
+    cur[key_path[-1]] = value
+
+
 def install_platform_configs(
     repo_root: Path,
     target: str = "all",
@@ -610,12 +659,13 @@ def install_platform_configs(
                     continue
                 existing = parsed
 
+        key_path = _key_path(server_key)
         expected_container = list if plat["format"] == "array" else dict
-        if server_key in existing and not isinstance(
-            existing[server_key], expected_container
-        ):
+        default_container: Any = [] if expected_container is list else {}
+        servers = _get_nested(existing, key_path, default_container)
+        if not isinstance(servers, expected_container):
             expected_name = "array" if expected_container is list else "object"
-            actual_name = type(existing[server_key]).__name__
+            actual_name = type(servers).__name__
             print(
                 f"  {plat['name']}: {config_path} setting {server_key!r} "
                 f"is {actual_name}; expected a JSON {expected_name} — "
@@ -625,15 +675,14 @@ def install_platform_configs(
             continue
 
         if plat["format"] == "array":
-            arr = existing.get(server_key, [])
             # Check if already present
-            if any(isinstance(s, dict) and s.get("name") == "code-review-graph" for s in arr):
+            if any(isinstance(s, dict) and s.get("name") == "code-review-graph" for s in servers):
                 print(f"  {plat['name']}: already configured in {config_path}")
                 _record_configured(key, plat)
                 continue
             arr_entry = {"name": "code-review-graph", **server_entry}
-            arr.append(arr_entry)
-            existing[server_key] = arr
+            servers.append(arr_entry)
+            _set_nested(existing, key_path, servers)
         else:
             # Remove entries written under keys the client never read, then
             # install the validated entry under the current key.
@@ -648,13 +697,12 @@ def install_platform_configs(
                     if not legacy:
                         del existing[legacy_key]
                     migrated = True
-            servers = existing.get(server_key, {})
             if "code-review-graph" in servers and not migrated:
                 print(f"  {plat['name']}: already configured in {config_path}")
                 _record_configured(key, plat)
                 continue
             servers["code-review-graph"] = server_entry
-            existing[server_key] = servers
+            _set_nested(existing, key_path, servers)
 
         if dry_run:
             print(f"  [dry-run] {plat['name']}: would write {config_path}")
@@ -1273,7 +1321,7 @@ def inject_claude_md(repo_root: Path) -> None:
 # Used to filter writes when the user passes --platform <X>: only files
 # whose owner set includes the target (or "all") are written.
 _PLATFORM_INSTRUCTION_FILES: dict[str, tuple[str, ...]] = {
-    "AGENTS.md": ("cursor", "opencode", "antigravity", "codex"),
+    "AGENTS.md": ("cursor", "opencode", "antigravity", "codex", "zcode"),
     "GEMINI.md": ("antigravity", "gemini-cli"),
     ".cursorrules": ("cursor",),
     ".windsurfrules": ("windsurf",),
@@ -1491,6 +1539,84 @@ def install_codebuddy_skills(repo_root: Path) -> Path:
         logger.info("Wrote CodeBuddy skill: %s", skill_path)
 
     return skills_root
+
+
+def install_zcode_skills(repo_root: Path) -> Path:
+    """Install project skills in .zcode/skills/<name>/SKILL.md."""
+    skills_root = repo_root / ".zcode" / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+
+    for filename, skill in _SKILLS.items():
+        slug = filename.rsplit(".", 1)[0]
+        skill_dir = skills_root / slug
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_path = skill_dir / "SKILL.md"
+        content = (
+            "---\n"
+            f"name: {slug}\n"
+            f"description: {skill['description']}\n"
+            "---\n\n"
+            f"{skill['body']}\n"
+        )
+        skill_path.write_text(content, encoding="utf-8")
+        logger.info("Wrote ZCode skill: %s", skill_path)
+
+    return skills_root
+
+
+def install_zcode_hooks(repo_root: Path) -> Path:
+    """Install ZCode workspace hooks in .zcode/config.json.
+
+    ZCode requires ``hooks.enabled: true`` for config-file hooks to run. The
+    hook commands resolve the repo root at runtime so the committed config is
+    portable across collaborators and checkout paths.
+    """
+    settings_dir = repo_root / ".zcode"
+    settings_path = settings_dir / "config.json"
+
+    existing: dict[str, Any] = {}
+    if settings_path.exists():
+        try:
+            existing = json.loads(settings_path.read_text(encoding="utf-8", errors="replace"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not read existing %s: %s", settings_path, exc)
+
+    hooks_config = generate_hooks_config(repo_root)
+    zcode_hooks: dict[str, Any] = {"enabled": True}
+    zcode_hooks.update(hooks_config.get("hooks", {}))
+
+    existing_hooks = existing.get("hooks", {})
+    if isinstance(existing_hooks, dict):
+        merged_hooks = dict(existing_hooks)
+        # Ensure hooks are enabled while preserving any user-defined hooks.
+        merged_hooks["enabled"] = True
+        for event_name, hook_entries in zcode_hooks.items():
+            if event_name == "enabled":
+                continue
+            if isinstance(merged_hooks.get(event_name), list):
+                merged_list = list(merged_hooks[event_name])
+                for entry in hook_entries:
+                    if entry not in merged_list:
+                        merged_list.append(entry)
+                merged_hooks[event_name] = merged_list
+            else:
+                merged_hooks[event_name] = hook_entries
+        existing["hooks"] = merged_hooks
+    else:
+        if not isinstance(existing_hooks, dict) and "hooks" in existing:
+            logger.warning(
+                "Existing hooks setting in %s is not a dict; replacing with defaults",
+                settings_path,
+            )
+        existing["hooks"] = zcode_hooks
+
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(
+        json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    logger.info("Wrote ZCode hooks config: %s", settings_path)
+    return settings_path
 
 
 def inject_platform_instructions(repo_root: Path, target: str = "all") -> list[str]:

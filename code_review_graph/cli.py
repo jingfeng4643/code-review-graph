@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 _PLATFORM_CHOICES = [
     "codex", "claude", "claude-code", "cursor", "windsurf", "zed",
     "continue", "opencode", "antigravity", "gemini-cli", "qwen", "kiro", "qoder",
-    "copilot", "copilot-cli", "codebuddy", "all",
+    "copilot", "copilot-cli", "codebuddy", "zcode", "all",
 ]
 
 
@@ -318,6 +318,8 @@ def _handle_init(args: argparse.Namespace) -> None:
         install_hooks,
         install_opencode_plugin,
         install_qoder_skills,
+        install_zcode_hooks,
+        install_zcode_skills,
     )
 
     if not skip_skills:
@@ -335,6 +337,11 @@ def _handle_init(args: argparse.Namespace) -> None:
         if target in ("codebuddy", "all"):
             codebuddy_skills_dir = install_codebuddy_skills(repo_root)
             print(f"Installed CodeBuddy skills in {codebuddy_skills_dir}")
+
+        # ZCode discovers project skills under .zcode/skills/.
+        if target in ("zcode", "all"):
+            zcode_skills_dir = install_zcode_skills(repo_root)
+            print(f"Installed ZCode skills in {zcode_skills_dir}")
 
     # Confirm before writing instruction files (#173). --yes skips the
     # prompt; --no-instructions skips the whole block.
@@ -368,6 +375,12 @@ def _handle_init(args: argparse.Namespace) -> None:
             print(f"Installed CodeBuddy hooks in {codebuddy_settings}")
         except Exception as exc:
             logger.warning("Could not install CodeBuddy hooks: %s", exc)
+    if not skip_hooks and target in ("zcode", "all"):
+        try:
+            zcode_settings = install_zcode_hooks(repo_root)
+            print(f"Installed ZCode hooks in {zcode_settings}")
+        except Exception as exc:
+            logger.warning("Could not install ZCode hooks: %s", exc)
     if not skip_hooks and target in ("codex", "all"):
         hooks_path = install_codex_hooks(repo_root)
         print(f"Installed Codex hooks in {hooks_path}")

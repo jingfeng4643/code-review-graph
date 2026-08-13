@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -22,9 +23,12 @@ from code_review_graph.skills import (
     _copilot_vscode_detected,
     _cursor_hook_scripts,
     _detect_serve_command,
+    _get_nested,
     _in_poetry_project,
     _in_uv_project,
+    _key_path,
     _opencode_plugin_content,
+    _set_nested,
     _strip_jsonc,
     generate_codex_hooks_config,
     generate_cursor_hooks_config,
@@ -40,6 +44,8 @@ from code_review_graph.skills import (
     install_hooks,
     install_opencode_plugin,
     install_platform_configs,
+    install_zcode_hooks,
+    install_zcode_skills,
 )
 
 _needs_tomllib = pytest.mark.skipif(
@@ -110,6 +116,30 @@ class TestStripJsonc:
     def test_strict_json_unchanged(self):
         src = '{"a": [1, 2], "b": {"c": "d, e"}}'
         assert json.loads(_strip_jsonc(src)) == json.loads(src)
+
+
+class TestNestedKeyHelpers:
+    """Tests for dotted-key traversal used by ZCode's nested ``mcp.servers``."""
+
+    def test_key_path_splits_on_dot(self):
+        assert _key_path("mcp.servers") == ["mcp", "servers"]
+        assert _key_path("mcpServers") == ["mcpServers"]
+
+    def test_get_nested_creates_intermediate_dicts(self):
+        data: dict[str, Any] = {}
+        result = _get_nested(data, ["mcp", "servers"], {})
+        assert result == {}
+        assert data == {"mcp": {"servers": {}}}
+
+    def test_get_nested_returns_existing_value(self):
+        data = {"mcp": {"servers": {"existing": {}}}}
+        result = _get_nested(data, ["mcp", "servers"], {})
+        assert result == {"existing": {}}
+
+    def test_set_nested_creates_and_sets_value(self):
+        data: dict[str, Any] = {}
+        _set_nested(data, ["mcp", "servers", "server"], {"command": "x"})
+        assert data == {"mcp": {"servers": {"server": {"command": "x"}}}}
 
 
 class TestGenerateSkills:
@@ -1939,6 +1969,149 @@ class TestCopilotCLIPlatform:
         inject_platform_instructions(tmp_path, target="copilot-cli")
 
         assert legacy.read_text(encoding="utf-8") == "# User instructions\n"
+
+
+class TestZcodePlatform:
+    """Tests for ZCode platform support."""
+
+    def test_platform_entry_exists(self):
+        assert "zcode" in PLATFORMS
+        platform = PLATFORMS["zcode"]
+        assert platform["name"] == "ZCode"
+        assert platform["config_path"](Path("/tmp/project")) == Path(
+            "/tmp/project/.zcode/config.json"
+        )
+        assert platform["key"] == "mcp.servers"
+        assert platform["format"] == "object"
+        assert platform["needs_type"] is False
+
+    def test_install_zcode_config_creates_nested_mcp_servers(self, tmp_path):
+        configured = install_platform_configs(tmp_path, target="zcode")
+        assert "ZCode" in configured
+        config_path = tmp_path / ".zcode" / "config.json"
+        assert config_path.exists()
+        data = json.loads(config_path.read_text())
+        assert "mcp" in data
+        assert "servers" in data["mcp"]
+        entry = data["mcp"]["servers"]["code-review-graph"]
+        expected_cmd, expected_args = _detect_serve_command()
+        assert entry["command"] == expected_cmd
+        assert entry["args"] == expected_args
+        assert "type" not in entry
+        assert entry["cwd"] == str(tmp_path)
+
+    def test_install_zcode_preserves_existing_config(self, tmp_path):
+        config_path = tmp_path / ".zcode" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            json.dumps(
+                {
+                    "editor": {"theme": "dark"},
+                    "mcp": {"servers": {"other": {"command": "other"}}},
+                    "hooks": {"enabled": True, "userEvent": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        install_platform_configs(tmp_path, target="zcode")
+
+        data = json.loads(config_path.read_text())
+        assert data["editor"]["theme"] == "dark"
+        assert data["mcp"]["servers"]["other"]["command"] == "other"
+        assert "code-review-graph" in data["mcp"]["servers"]
+        assert data["hooks"]["enabled"] is True
+        assert data["hooks"]["userEvent"] == []
+
+    def test_install_zcode_is_idempotent(self, tmp_path):
+        install_platform_configs(tmp_path, target="zcode")
+        first = (tmp_path / ".zcode" / "config.json").read_text()
+
+        # Re-running should not change the file.
+        install_platform_configs(tmp_path, target="zcode")
+        second = (tmp_path / ".zcode" / "config.json").read_text()
+
+        assert first == second
+
+    def test_install_zcode_skips_when_mcp_servers_is_wrong_type(self, tmp_path, capsys):
+        config_path = tmp_path / ".zcode" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            json.dumps({"mcp": {"servers": "not-a-dict"}}),
+            encoding="utf-8",
+        )
+
+        configured = install_platform_configs(tmp_path, target="zcode")
+
+        assert configured == []
+        out = capsys.readouterr().out
+        assert 'setting \'mcp.servers\' is str; expected a JSON object' in out
+
+    def test_install_zcode_skills_writes_skill_dirs(self, tmp_path):
+        skills_root = install_zcode_skills(tmp_path)
+        assert skills_root == tmp_path / ".zcode" / "skills"
+        for slug in ("explore-codebase", "review-changes", "debug-issue", "refactor-safely"):
+            skill_path = skills_root / slug / "SKILL.md"
+            assert skill_path.exists()
+            content = skill_path.read_text(encoding="utf-8")
+            assert content.startswith("---\n")
+            assert f"name: {slug}\n" in content
+            assert "description:" in content
+
+    def test_install_zcode_hooks_creates_enabled_hooks(self, tmp_path):
+        settings_path = install_zcode_hooks(tmp_path)
+        assert settings_path == tmp_path / ".zcode" / "config.json"
+        data = json.loads(settings_path.read_text())
+        assert data["hooks"]["enabled"] is True
+        assert "PostToolUse" in data["hooks"]
+        assert "SessionStart" in data["hooks"]
+        matchers = {entry["matcher"] for entry in data["hooks"]["PostToolUse"]}
+        assert "Edit|Write" in matchers
+
+    def test_install_zcode_hooks_preserves_user_hooks(self, tmp_path):
+        user_hook = {
+            "matcher": "Read",
+            "hooks": [{"type": "command", "command": "echo user"}],
+        }
+        (tmp_path / ".zcode" / "config.json").parent.mkdir(parents=True)
+        (tmp_path / ".zcode" / "config.json").write_text(
+            json.dumps(
+                {
+                    "editor": "zcode",
+                    "hooks": {
+                        "enabled": True,
+                        "PostToolUse": [user_hook],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        install_zcode_hooks(tmp_path)
+
+        data = json.loads((tmp_path / ".zcode" / "config.json").read_text())
+        assert data["editor"] == "zcode"
+        assert user_hook in data["hooks"]["PostToolUse"]
+        # Our hook is also present.
+        commands = [
+            hook.get("command", "")
+            for entry in data["hooks"]["PostToolUse"]
+            for hook in entry.get("hooks", [])
+        ]
+        assert any("code-review-graph update" in c for c in commands)
+
+    def test_install_zcode_hooks_is_idempotent(self, tmp_path):
+        install_zcode_hooks(tmp_path)
+        first = (tmp_path / ".zcode" / "config.json").read_text()
+        install_zcode_hooks(tmp_path)
+        second = (tmp_path / ".zcode" / "config.json").read_text()
+        assert first == second
+
+    def test_zcode_injects_agents_md(self, tmp_path):
+        updated = inject_platform_instructions(tmp_path, target="zcode")
+        assert updated == ["AGENTS.md"]
+        content = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+        assert _CLAUDE_MD_SECTION_MARKER in content
 
 
 class TestDetectServeCommand:

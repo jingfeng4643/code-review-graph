@@ -11,6 +11,7 @@ import os
 import stat
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -29,6 +30,26 @@ def _write_json(path: Path, value: object) -> None:
 
 def _read_jsonc(path: Path) -> object:
     return json.loads(skills._strip_jsonc(path.read_text(encoding="utf-8")))
+
+
+def _nested_config(key: str, value: object) -> dict[str, Any]:
+    """Build a nested dict from a dotted key such as ``mcp.servers``."""
+    data: dict[str, Any] = {}
+    cur = data
+    parts = key.split(".")
+    for part in parts[:-1]:
+        cur[part] = {}
+        cur = cur[part]
+    cur[parts[-1]] = value
+    return data
+
+
+def _nested_get(data: dict[str, Any], key: str) -> Any:
+    """Traverse a nested dict using a dotted key."""
+    cur: Any = data
+    for part in key.split("."):
+        cur = cur[part]
+    return cur
 
 
 @pytest.fixture
@@ -75,7 +96,10 @@ def test_uninstall_removes_mcp_entry_for_every_current_platform_spec(
                 "code-review-graph": {"command": "code-review-graph"},
                 "other": {"url": "https://example.test/mcp"},
             }
-        _write_json(config_path, {spec["key"]: container, "theme": "dark"})
+        _write_json(
+            config_path,
+            _nested_config(spec["key"], container) | {"theme": "dark"},
+        )
 
     report = uninstall.run(repo=fake_repo, keep_data=True)
 
@@ -87,7 +111,7 @@ def test_uninstall_removes_mcp_entry_for_every_current_platform_spec(
         assert 'theme = "dark"' in text
     else:
         data = _read_jsonc(config_path)
-        container = data[spec["key"]]
+        container = _nested_get(data, spec["key"])
         if spec["format"] == "array":
             assert [entry["name"] for entry in container] == ["other"]
         else:

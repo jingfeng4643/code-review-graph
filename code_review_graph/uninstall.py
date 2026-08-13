@@ -412,6 +412,25 @@ def _parse_jsonc(path: Path, raw: str, report: UninstallReport) -> dict[str, Any
     return parsed
 
 
+def _traverse_key_path(
+    data: dict[str, Any], key_path: list[str],
+) -> tuple[Any, bool]:
+    """Return the value at ``key_path`` and whether it was found.
+
+    Traverses nested objects. Missing intermediate dicts or keys mean the
+    target is not present.
+    """
+    cur: Any = data
+    for k in key_path[:-1]:
+        if not isinstance(cur, dict) or k not in cur:
+            return None, False
+        cur = cur[k]
+    final_key = key_path[-1]
+    if not isinstance(cur, dict) or final_key not in cur:
+        return None, False
+    return cur[final_key], True
+
+
 def _remove_mcp_entry(
     path: Path,
     *,
@@ -429,11 +448,15 @@ def _remove_mcp_entry(
     if raw is None:
         return
     data = _parse_jsonc(path, raw, report)
-    if data is None or key not in data:
+    if data is None:
+        return
+
+    key_path = key.split(".")
+    container, found = _traverse_key_path(data, key_path)
+    if not found:
         return
 
     expected_type = list if format_name == "array" else dict
-    container = data[key]
     if not isinstance(container, expected_type):
         expected = "array" if expected_type is list else "object"
         report.skipped_paths.append(
@@ -447,9 +470,14 @@ def _remove_mcp_entry(
             for index, entry in enumerate(container)
             if isinstance(entry, dict) and entry.get("name") == _ENTRY_NAME
         ]
-        paths: list[tuple[str | int, ...]] = [(key, index) for index in indices]
+        paths: list[tuple[str | int, ...]] = [
+            (*key_path, index) for index in indices
+        ]
         expected_data = copy.deepcopy(data)
-        expected_data[key] = [
+        expected_container = expected_data
+        for k in key_path[:-1]:
+            expected_container = expected_container[k]
+        expected_container[key_path[-1]] = [
             entry
             for entry in container
             if not (isinstance(entry, dict) and entry.get("name") == _ENTRY_NAME)
@@ -457,9 +485,12 @@ def _remove_mcp_entry(
     else:
         if _ENTRY_NAME not in container:
             return
-        paths = [(key, _ENTRY_NAME)]
+        paths = [tuple([*key_path, _ENTRY_NAME])]
         expected_data = copy.deepcopy(data)
-        del expected_data[key][_ENTRY_NAME]
+        expected_container = expected_data
+        for k in key_path[:-1]:
+            expected_container = expected_container[k]
+        del expected_container[key_path[-1]][_ENTRY_NAME]
     if not paths:
         return
 
